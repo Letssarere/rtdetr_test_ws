@@ -32,21 +32,19 @@ def resize_with_aspect_ratio(image: PILImage.Image, size: int):
     return new_image, ratio, pad_w, pad_h
 
 
-class RTDetrV4OnnxNode(Node):
+class RTDetrV4TestNode(Node):
     def __init__(self):
-        super().__init__("rtdetr_v4_onnx_node")
+        super().__init__("rtdetr_v4_test_node")
 
         # Parameters
         self.declare_parameter("input_topic", "/camera/color/image_raw")
-        self.declare_parameter("output_topic", "/rtdetr_v4_detection/image_result")
         self.declare_parameter("timer_period", 1.0)
-        self.declare_parameter("score_threshold", 0.4)
+        self.declare_parameter("score_threshold", 0.5)
         self.declare_parameter("input_size", 640)
         # model_path can be a file or a directory containing RTv4-S-hgnet.onnx
         self.declare_parameter("model_path", "")
 
         self.input_topic = self.get_parameter("input_topic").get_parameter_value().string_value
-        self.output_topic = self.get_parameter("output_topic").get_parameter_value().string_value
         self.timer_period = float(self.get_parameter("timer_period").value)
         self.score_threshold = (
             self.get_parameter("score_threshold").get_parameter_value().double_value
@@ -78,11 +76,14 @@ class RTDetrV4OnnxNode(Node):
             durability=DurabilityPolicy.VOLATILE,
         )
         self.create_subscription(Image, self.input_topic, self.image_callback, qos)
-        self.pub = self.create_publisher(Image, self.output_topic, 1)
 
         # 1 Hz timer
         self.timer = self.create_timer(self.timer_period, self.run_inference)
-        self.get_logger().info("RT-DETR v4 ONNX node initialized.")
+
+        self.window_name = "RT-DETR v4 Test"
+        cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+
+        self.get_logger().info("RT-DETR v4 test node initialized.")
 
     def resolve_model_path(self, override_path: str) -> Path:
         """Determine ONNX model path with reasonable fallbacks."""
@@ -174,20 +175,22 @@ class RTDetrV4OnnxNode(Node):
                 2,
             )
 
-        out_msg = self.bridge.cv2_to_imgmsg(frame, encoding="bgr8")
-        out_msg.header.stamp = self.get_clock().now().to_msg()
-        out_msg.header.frame_id = "camera_color_frame"
-        self.pub.publish(out_msg)
+        cv2.imshow(self.window_name, frame)
+        cv2.waitKey(1)
 
         det_count = int(keep.sum())
         self.get_logger().info(
             f"RT-DETR v4 inference: {infer_ms:.1f} ms, detections: {det_count}"
         )
 
+    def destroy_node(self):
+        cv2.destroyWindow(self.window_name)
+        return super().destroy_node()
+
 
 def main(args=None):
     rclpy.init(args=args)
-    node = RTDetrV4OnnxNode()
+    node = RTDetrV4TestNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

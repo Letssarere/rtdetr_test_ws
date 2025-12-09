@@ -1,6 +1,7 @@
 import json
 import time
 from pathlib import Path
+from threading import Lock
 
 import cv2
 import numpy as np
@@ -9,22 +10,26 @@ import rclpy
 from ament_index_python.packages import get_package_share_directory
 from cv_bridge import CvBridge
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image
 
-class RTDETRNode(Node):
+
+class RTDetrV2TestNode(Node):
     def __init__(self):
-        super().__init__('rtdetr_detector')
+        super().__init__('rtdetr_v2_test_node')
 
         # ---------------------------------------------------------
         # 1. 파라미터 및 경로 설정
         # ---------------------------------------------------------
         self.declare_parameter('input_topic', '/camera/color/image_raw')
-        self.declare_parameter('output_topic', '/rtdetr_v2_detection/image_result')
+        self.declare_parameter('score_threshold', 0.5)
+        self.declare_parameter('input_size', 640)
         self.declare_parameter('timer_period', 1.0)
         self.declare_parameter('model_dir', '')
 
-        self.input_topic = self.get_parameter('input_topic').value
-        self.output_topic = self.get_parameter('output_topic').value
+        self.input_topic = self.get_parameter('input_topic').get_parameter_value().string_value
+        self.score_threshold = self.get_parameter('score_threshold').get_parameter_value().double_value
+        self.input_size = int(self.get_parameter('input_size').get_parameter_value().integer_value)
         self.timer_period = float(self.get_parameter('timer_period').value)
 
         self.model_dir = self.resolve_model_dir(self.get_parameter('model_dir').value)
@@ -59,29 +64,28 @@ class RTDETRNode(Node):
         # 3. ROS 통신 설정
         # ---------------------------------------------------------
         self.bridge = CvBridge()
+        self.lock = Lock()
+        self.latest_frame = None
         
-        # RealSense 컬러 이미지 토픽 구독
-        self.sub = self.create_subscription(
-            Image,
-            self.input_topic, # 실제 사용하는 토픽명으로 확인 필요
-            self.image_callback,
-            10
+        qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
         )
+        # RealSense 컬러 이미지 토픽 구독
+        self.sub = self.create_subscription(Image, self.input_topic, self.image_callback, qos)
         
-        # 결과 이미지 발행
-        self.pub = self.create_publisher(Image, self.output_topic, 10)
-
         # 1Hz 실행을 위한 타이머 (1.0초)
-        self.timer = self.create_timer(self.timer_period, self.timer_callback)
-        
-        # 최신 이미지를 저장할 변수
-        self.latest_cv_image = None
+        self.timer = self.create_timer(self.timer_period, self.run_inference)
         
         # 설정값
-        self.conf_threshold = 0.5  # 탐지 임계값
-        self.input_shape = (640, 640) # 모델 입력 크기
+        self.input_shape = (self.input_size, self.input_size) # 모델 입력 크기
 
-        self.get_logger().info("RT-DETR Node initialized. Running at 1Hz.")
+        # OpenCV 시각화 창
+        self.window_name = "RT-DETR v2 Test"
+        cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+
+        self.get_logger().info("RT-DETR v2 test node initialized. Running at 1Hz.")
 
     def load_labels(self, config_path):
         """config.json에서 id2label 정보를 읽어옵니다."""
@@ -102,17 +106,20 @@ class RTDETRNode(Node):
         """이미지를 수신하면 최신 프레임만 변수에 업데이트합니다."""
         try:
             # ROS Image -> OpenCV Image (BGR)
-            self.latest_cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            with self.lock:
+                self.latest_frame = frame
         except Exception as e:
             self.get_logger().error(f"CvBridge Error: {e}")
 
-    def timer_callback(self):
-        """1초마다 실행되어 추론을 수행합니다."""
-        if self.latest_cv_image is None:
-            return
+    def run_inference(self):
+        """주기적으로 추론을 수행합니다."""
+        with self.lock:
+            if self.latest_frame is None:
+                return
+            original_image = self.latest_frame.copy()
 
         # 1. 전처리
-        original_image = self.latest_cv_image.copy()
         orig_h, orig_w, _ = original_image.shape
         
         # Resize & Normalize
@@ -121,9 +128,9 @@ class RTDETRNode(Node):
         image_data = cv2.cvtColor(image_resized, cv2.COLOR_BGR2RGB) # ONNX는 보통 RGB를 예상함
         image_data = image_data.astype(np.float32) / 255.0
         
-        # HWC -> CHW 변환 (3, 640, 640)
+        # HWC -> CHW 변환 (3, input_size, input_size)
         image_data = np.transpose(image_data, (2, 0, 1))
-        # Batch 차원 추가 (1, 3, 640, 640)
+        # Batch 차원 추가 (1, 3, input_size, input_size)
         input_tensor = np.expand_dims(image_data, axis=0)
 
         # 2. 추론 (Inference)
@@ -142,33 +149,32 @@ class RTDETRNode(Node):
         # 3. 후처리 및 시각화
         scores = self.sigmoid(np.max(logits, axis=1)) # 각 박스의 최대 클래스 확률
         class_ids = np.argmax(logits, axis=1)         # 각 박스의 클래스 ID
-        
-        for i in range(len(scores)):
-            score = scores[i]
-            if score > self.conf_threshold:
-                # 박스 좌표 복원 (cx, cy, w, h) -> (x1, y1, x2, y2)
-                box = boxes[i]
-                cx, cy, w, h = box
-                
-                # 정규화된 좌표를 원본 이미지 크기로 변환
-                x1 = int((cx - w/2) * orig_w)
-                y1 = int((cy - h/2) * orig_h)
-                x2 = int((cx + w/2) * orig_w)
-                y2 = int((cy + h/2) * orig_h)
-                
-                class_id = str(class_ids[i])
-                label_name = self.labels.get(class_id, f"ID {class_id}")
-                
-                # 그리기
-                cv2.rectangle(original_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                text = f"{label_name}: {score:.2f}"
-                cv2.putText(original_image, text, (x1, y1 - 10), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        keep = scores > self.score_threshold
 
-        # 4. 결과 발행
-        out_msg = self.bridge.cv2_to_imgmsg(original_image, encoding='bgr8')
-        self.pub.publish(out_msg)
-        self.get_logger().info(f"RT-DETR v2 inference: {infer_ms:.1f} ms")
+        for i in np.where(keep)[0]:
+            score = scores[i]
+            box = boxes[i]
+            cx, cy, w, h = box
+            
+            # 정규화된 좌표를 원본 이미지 크기로 변환
+            x1 = int((cx - w/2) * orig_w)
+            y1 = int((cy - h/2) * orig_h)
+            x2 = int((cx + w/2) * orig_w)
+            y2 = int((cy + h/2) * orig_h)
+            
+            class_id = str(class_ids[i])
+            label_name = self.labels.get(class_id, f"ID {class_id}")
+            
+            cv2.rectangle(original_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            text = f"{label_name}: {score:.2f}"
+            cv2.putText(original_image, text, (x1, y1 - 10), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+        # 4. 결과 시각화 (토픽 발행 대신 OpenCV 창 표시)
+        cv2.imshow(self.window_name, original_image)
+        cv2.waitKey(1)
+        det_count = int(keep.sum())
+        self.get_logger().info(f"RT-DETR v2 inference: {infer_ms:.1f} ms, detections: {det_count}")
 
     def sigmoid(self, x):
         return 1 / (1 + np.exp(-x))
@@ -197,9 +203,13 @@ class RTDETRNode(Node):
         # 존재하지 않으면 마지막으로 fallback 반환 (상단에서 에러 처리)
         return fallback
 
+    def destroy_node(self):
+        cv2.destroyWindow(self.window_name)
+        return super().destroy_node()
+
 def main(args=None):
     rclpy.init(args=args)
-    node = RTDETRNode()
+    node = RTDetrV2TestNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
